@@ -2,6 +2,8 @@
 
 文部科学省が公表する学校コードを、学校名や都道府県、学校種、設置区分から調べられます。コードが分かっていれば、所在地などを照会し、2つの公表版で同じ学校の記録を比較できます。
 
+[MCP登録](#mcpクライアントに登録する) · [CLI](#cliで使う) · [Pythonライブラリ](#pythonライブラリとして使う)
+
 ## 利用前に
 
 [uv](https://docs.astral.sh/uv/) と Git が必要です。Python 3.12以上に対応しています。APIキーの設定は不要です。
@@ -77,17 +79,15 @@ uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.
 uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.git@main jp-school-code-mcp compare-school-records --school-code F113310103073 --from-date 2025-05-01 --to-date 2026-05-01
 ```
 
-## Pythonから呼び出す
+## Pythonライブラリとして使う
 
-リポジトリをクローンし、依存関係を準備します。
+自分のPythonプロジェクト（`pyproject.toml` があるディレクトリ）で依存関係に追加します。
 
 ```sh
-git clone https://github.com/koizumikento/jp-school-code-mcp.git
-cd jp-school-code-mcp
-uv sync --locked
+uv add "git+https://github.com/koizumikento/jp-school-code-mcp.git@main"
 ```
 
-次の例を `example.py` に保存し、クローン先で `uv run --locked python example.py` を実行します。
+次のコードを `example.py` に保存し、同じディレクトリで `uv run python example.py` を実行します。
 
 ```python
 import asyncio
