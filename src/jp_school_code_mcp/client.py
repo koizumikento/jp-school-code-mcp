@@ -19,9 +19,16 @@ OperatorCategory = Literal["1", "2", "3"]
 RELEASE_HEADING = re.compile(
     r"令和([0-9元]+)年([0-9]+)月([0-9]+)日時点\s*[（(](暫定版|確定版)[）)]"
 )
+PREFECTURES = (
+    "北海道 青森県 岩手県 宮城県 秋田県 山形県 福島県 茨城県 栃木県 群馬県 埼玉県 千葉県 "
+    "東京都 神奈川県 新潟県 富山県 石川県 福井県 山梨県 長野県 岐阜県 静岡県 愛知県 三重県 "
+    "滋賀県 京都府 大阪府 兵庫県 奈良県 和歌山県 鳥取県 島根県 岡山県 広島県 山口県 徳島県 "
+    "香川県 愛媛県 高知県 福岡県 佐賀県 長崎県 "
+    "熊本県 大分県 宮崎県 鹿児島県 沖縄県"
+).split()
 
 
-def _release_files(page: str, as_of: date | None) -> tuple[date, str, list[str]]:
+def _release_files(page: str, as_of: date | None) -> tuple[date, str, list[str], bool]:
     _, current, section = page.partition("最新の学校コード一覧")
     current_section, archive, archive_section = section.partition("過去の学校コード一覧")
     if not current or not archive:
@@ -29,14 +36,15 @@ def _release_files(page: str, as_of: date | None) -> tuple[date, str, list[str]]
     sections = [current_section]
     if as_of is not None:
         sections.append(archive_section.partition("都道府県が定める付番方針")[0])
-    for section in sections:
+    for section_index, section in enumerate(sections):
         releases = list(RELEASE_HEADING.finditer(section))
         for index, release in enumerate(releases):
             year, month, day, edition = release.groups()
             data_as_of = date(2018 + (1 if year == "元" else int(year)), int(month), int(day))
             if as_of is None or as_of == data_as_of:
                 end = releases[index + 1].start() if index + 1 < len(releases) else len(section)
-                return data_as_of, edition, _csv_urls(section[release.end() : end])
+                urls = _csv_urls(section[release.end() : end])
+                return data_as_of, edition, urls, section_index > 0
     if as_of is not None:
         raise ValueError(f"MEXT does not list a school-code release for {as_of.isoformat()}.")
     raise ValueError("MEXT's current school-code release could not be identified.")
@@ -59,8 +67,10 @@ def _csv_urls(section: str) -> list[str]:
 
 def _load_schools(fetch: Callable[[str], Document], as_of: date | None = None) -> dict[str, Any]:
     page = fetch(SOURCE_URL).body.decode("utf-8-sig")
-    data_as_of, edition, urls = _release_files(page, as_of)
+    data_as_of, edition, urls, historical = _release_files(page, as_of)
     entries: dict[str, dict[str, str | None]] = {}
+    conflicts: dict[str, list[dict[str, Any]]] = {}
+    original_rows: dict[str, tuple[list[str], list[str], str]] = {}
     prefecture_codes: set[str] = set()
     for url in urls:
         raw = fetch(url).body
@@ -83,34 +93,75 @@ def _load_schools(fetch: Callable[[str], Document], as_of: date | None = None) -
         for row in rows:
             if not any(row):
                 continue
-            prefecture = re.fullmatch(r"([0-9]{2})\(([^)]+)\)", row[2]) if len(row) >= 10 else None
-            if not prefecture or not re.fullmatch(r"[A-Z][0-9]{12}", row[0]) or not row[5]:
+            prefecture = (
+                re.fullmatch(r"([0-9]{1,2})(?:\(([^)]+)\))?", row[2]) if len(row) >= 10 else None
+            )
+            school_code = row[0].strip()
+            if not prefecture or not re.fullmatch(r"[A-Z][0-9]{12}", school_code) or not row[5]:
                 raise ValueError("Invalid row in the MEXT school-code CSV.")
             prefecture_code, prefecture_name = prefecture.groups()
+            prefecture_code = prefecture_code.zfill(2)
+            if not 1 <= int(prefecture_code) <= len(PREFECTURES):
+                raise ValueError("Invalid prefecture number in the MEXT school-code CSV.")
             prefecture_codes.add(prefecture_code)
-            if not prefecture_name.endswith(("都", "道", "府", "県")) or prefecture_name == "京都":
+            postal_code = row[7] or None
+            if prefecture_name is None:
+                prefecture_name = PREFECTURES[int(prefecture_code) - 1]
+                # Some archived files dropped leading zeroes from numeric columns.
+                if postal_code and re.fullmatch(r"[0-9]{5,6}", postal_code):
+                    postal_code = postal_code.zfill(7)
+            elif (
+                not prefecture_name.endswith(("都", "道", "府", "県")) or prefecture_name == "京都"
+            ):
                 prefecture_name += {"東京": "都", "京都": "府", "大阪": "府"}.get(
                     prefecture_name, "県"
                 )
             entry = {
-                "school_code": row[0],
+                "school_code": school_code,
                 "school_type": row[1],
                 "prefecture": prefecture_name,
                 "name": row[5],
                 "address": row[6] or None,
-                "postal_code": row[7] or None,
+                "postal_code": postal_code,
                 "closed_on": row[9] or None,
             }
-            if row[0] in entries and entries[row[0]] != entry:
-                raise ValueError("The MEXT school-code files contain conflicting records.")
-            entries[row[0]] = entry
+            previous = entries.get(school_code)
+            if previous is not None:
+                if historical:
+                    old_header, old_row, old_url = original_rows[school_code]
+                    if row != old_row:
+                        candidates = conflicts.setdefault(
+                            school_code, [_source_record(previous, old_header, old_row, old_url)]
+                        )
+                        if all(candidate["source_values"] != row for candidate in candidates):
+                            candidates.append(_source_record(entry, header, row, url))
+                elif previous != entry:
+                    raise ValueError("The MEXT school-code files contain conflicting records.")
+                continue
+            entries[school_code] = entry
+            if historical:
+                original_rows[school_code] = header, row, url
     if prefecture_codes != {f"{code:02}" for code in range(1, 48)}:
         raise ValueError("MEXT school-code release does not cover all 47 prefectures.")
-    return {
+    data = {
         "data_as_of": data_as_of.isoformat(),
         "edition": edition,
         "source_urls": [SOURCE_URL, *urls],
         "entries": entries,
+    }
+    if conflicts:
+        data["conflicts"] = conflicts
+    return data
+
+
+def _source_record(
+    item: dict[str, Any], header: list[str], row: list[str], url: str
+) -> dict[str, Any]:
+    return {
+        "school": _school_record(item),
+        "source_url": url,
+        "source_columns": header,
+        "source_values": row,
     }
 
 
@@ -168,9 +219,11 @@ async def search_schools(
 async def get_school(school_code: SchoolCode, *, as_of: date | None = None) -> dict[str, Any]:
     """Read a school record by 13-character code. Omit as_of for the latest MEXT release."""
     snapshot = await _snapshot(as_of=as_of)
-    school = snapshot.data["entries"].get(school_code)
+    conflicts = snapshot.data.get("conflicts", {}).get(school_code)
+    school = None if conflicts else snapshot.data["entries"].get(school_code)
     return {
         "school": _school_record(school) if school is not None else None,
+        **({"conflicting_records": conflicts} if conflicts else {}),
         "edition": snapshot.data["edition"],
         **snapshot.metadata(),
     }
@@ -187,7 +240,11 @@ async def compare_school_records(
     after = await get_school(school_code, as_of=to_date)
     previous, current = before["school"], after["school"]
     changed_fields = (
-        [field for field in previous if previous[field] != current[field]]
+        [
+            field
+            for field in ("name", "address", "postal_code", "closed_on")
+            if previous[field] != current[field]
+        ]
         if previous is not None and current is not None
         else None
     )
