@@ -4,7 +4,7 @@ import unicodedata
 from collections.abc import Callable
 from datetime import date, timedelta
 from io import StringIO
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urljoin, urlsplit
 
 from pydantic import Field, StringConstraints, validate_call
@@ -14,19 +14,39 @@ from ._cache import Document, Snapshot, cache_path, load_snapshot
 SOURCE_URL = "https://www.mext.go.jp/b_menu/toukei/mext_01087.html"
 SchoolCode = Annotated[str, StringConstraints(pattern=r"^[A-Z][0-9]{12}$")]
 SearchText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+SchoolType = Literal["A1", "A2", "B1", "C1", "C2", "D1", "D2", "E1", "F1", "F2", "G1", "H1", "H2"]
+OperatorCategory = Literal["1", "2", "3"]
+RELEASE_HEADING = re.compile(
+    r"令和([0-9元]+)年([0-9]+)月([0-9]+)日時点\s*[（(](暫定版|確定版)[）)]"
+)
 
 
-def _load_schools(fetch: Callable[[str], Document]) -> dict[str, Any]:
-    page = fetch(SOURCE_URL).body.decode("utf-8-sig")
+def _release_files(page: str, as_of: date | None) -> tuple[date, str, list[str]]:
     _, current, section = page.partition("最新の学校コード一覧")
-    section, archive, _ = section.partition("過去の学校コード一覧")
-    release = re.search(
-        r"令和([0-9元]+)年([0-9]+)月([0-9]+)日時点\s*[（(](暫定版|確定版)[）)]", section
-    )
+    current_section, archive, archive_section = section.partition("過去の学校コード一覧")
+    if not current or not archive:
+        raise ValueError("MEXT's school-code release list could not be identified.")
+    sections = [current_section]
+    if as_of is not None:
+        sections.append(archive_section.partition("都道府県が定める付番方針")[0])
+    for section in sections:
+        releases = list(RELEASE_HEADING.finditer(section))
+        for index, release in enumerate(releases):
+            year, month, day, edition = release.groups()
+            data_as_of = date(2018 + (1 if year == "元" else int(year)), int(month), int(day))
+            if as_of is None or as_of == data_as_of:
+                end = releases[index + 1].start() if index + 1 < len(releases) else len(section)
+                return data_as_of, edition, _csv_urls(section[release.end() : end])
+    if as_of is not None:
+        raise ValueError(f"MEXT does not list a school-code release for {as_of.isoformat()}.")
+    raise ValueError("MEXT's current school-code release could not be identified.")
+
+
+def _csv_urls(section: str) -> list[str]:
     hrefs = re.findall(r"""\bhref=["']([^"']+\.csv)["']""", section, re.IGNORECASE)
     urls = list(dict.fromkeys(urljoin(SOURCE_URL, href) for href in hrefs))
-    if not current or not archive or not release or not urls:
-        raise ValueError("MEXT's current school-code release could not be identified.")
+    if not urls:
+        raise ValueError("MEXT's school-code release does not list CSV files.")
     if any(
         (parsed := urlsplit(url)).netloc != "www.mext.go.jp"
         or parsed.scheme != "https"
@@ -34,8 +54,12 @@ def _load_schools(fetch: Callable[[str], Document]) -> dict[str, Any]:
         for url in urls
     ):
         raise ValueError("MEXT's school-code page contains an unexpected download URL.")
-    year, month, day, edition = release.groups()
-    data_as_of = date(2018 + (1 if year == "元" else int(year)), int(month), int(day))
+    return urls
+
+
+def _load_schools(fetch: Callable[[str], Document], as_of: date | None = None) -> dict[str, Any]:
+    page = fetch(SOURCE_URL).body.decode("utf-8-sig")
+    data_as_of, edition, urls = _release_files(page, as_of)
     entries: dict[str, dict[str, str | None]] = {}
     prefecture_codes: set[str] = set()
     for url in urls:
@@ -90,30 +114,49 @@ def _load_schools(fetch: Callable[[str], Document]) -> dict[str, Any]:
     }
 
 
-async def _snapshot(*, force: bool = False) -> Snapshot:
+async def _snapshot(*, force: bool = False, as_of: date | None = None) -> Snapshot:
     path = cache_path("jp-school-code-mcp", "JP_SCHOOL_CODE_CACHE_DIR")
-    return await load_snapshot(path, "current", timedelta(days=7), _load_schools, force=force)
+    key = "current" if as_of is None else f"release-{as_of.isoformat()}"
+    return await load_snapshot(
+        path, key, timedelta(days=7), lambda fetch: _load_schools(fetch, as_of), force=force
+    )
+
+
+def _school_record(item: dict[str, Any]) -> dict[str, Any]:
+    # The first two characters identify the type, and the fifth identifies the operator.
+    return {**item, "operator_category": item["school_code"][4]}
 
 
 @validate_call
 async def search_schools(
-    name: SearchText,
+    name: SearchText | None = None,
     prefecture: SearchText | None = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
     offset: Annotated[int, Field(ge=0)] = 0,
+    *,
+    school_type: SchoolType | None = None,
+    operator_category: OperatorCategory | None = None,
 ) -> dict[str, Any]:
-    """Find schools by partial name and optional exact prefecture. Use next_offset for more."""
+    """Find schools by partial name, exact prefecture, school type or operator category.
+
+    School type codes include B1 (elementary), C1 (junior high), D1 (high) and F1 (university).
+    Operator categories are 1 (national), 2 (public) and 3 (private). Use next_offset for more.
+    """
+    if all(value is None for value in (name, prefecture, school_type, operator_category)):
+        raise ValueError("Supply at least one school search condition.")
     snapshot = await _snapshot()
-    query = unicodedata.normalize("NFKC", name).casefold()
+    query = unicodedata.normalize("NFKC", name).casefold() if name is not None else None
     entries = [
         item
         for item in snapshot.data["entries"].values()
         if (prefecture is None or item["prefecture"] == prefecture)
-        and query in unicodedata.normalize("NFKC", item["name"]).casefold()
+        and (school_type is None or item["school_code"].startswith(school_type))
+        and (operator_category is None or item["school_code"][4] == operator_category)
+        and (query is None or query in unicodedata.normalize("NFKC", item["name"]).casefold())
     ]
     end = offset + limit
     return {
-        "items": entries[offset:end],
+        "items": [_school_record(item) for item in entries[offset:end]],
         "total": len(entries),
         "next_offset": end if end < len(entries) else None,
         "edition": snapshot.data["edition"],
@@ -122,13 +165,37 @@ async def search_schools(
 
 
 @validate_call
-async def get_school(school_code: SchoolCode) -> dict[str, Any]:
-    """Read one school record from the latest MEXT release by its 13-character school code."""
-    snapshot = await _snapshot()
+async def get_school(school_code: SchoolCode, *, as_of: date | None = None) -> dict[str, Any]:
+    """Read a school record by 13-character code. Omit as_of for the latest MEXT release."""
+    snapshot = await _snapshot(as_of=as_of)
+    school = snapshot.data["entries"].get(school_code)
     return {
-        "school": snapshot.data["entries"].get(school_code),
+        "school": _school_record(school) if school is not None else None,
         "edition": snapshot.data["edition"],
         **snapshot.metadata(),
+    }
+
+
+@validate_call
+async def compare_school_records(
+    school_code: SchoolCode, from_date: date, to_date: date
+) -> dict[str, Any]:
+    """Compare a school's published records on two MEXT reference dates (YYYY-MM-DD)."""
+    if from_date >= to_date:
+        raise ValueError("from_date must be earlier than to_date.")
+    before = await get_school(school_code, as_of=from_date)
+    after = await get_school(school_code, as_of=to_date)
+    previous, current = before["school"], after["school"]
+    changed_fields = (
+        [field for field in previous if previous[field] != current[field]]
+        if previous is not None and current is not None
+        else None
+    )
+    return {
+        "school_code": school_code,
+        "before": before,
+        "after": after,
+        "changed_fields": changed_fields,
     }
 
 

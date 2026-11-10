@@ -1,6 +1,6 @@
 # jp-school-code-mcp
 
-文部科学省が公表する学校コードを、学校名や都道府県から調べられます。学校コードが分かっていれば、所在地などの情報を直接取得できます。
+文部科学省が公表する学校コードを、学校名や都道府県、学校種、設置区分から調べられます。コードが分かっていれば、所在地などを照会し、2つの公表版で同じ学校の記録を比較できます。
 
 ## 利用前に
 
@@ -58,15 +58,21 @@ Codexのデスクトップアプリでは、設定の「MCP servers」でSTDIO�
 
 | ツール | 用途 |
 | --- | --- |
-| `search_schools` | 学校名の部分一致で検索。都道府県名で絞り込み可能 |
-| `get_school` | 学校コードを指定して1件を照会 |
+| `search_schools` | 学校名（部分一致）、都道府県名（完全一致）、学校種、設置区分のうち1つ以上を指定して検索 |
+| `get_school` | 学校コードを指定して1件を照会。`as_of` で公表版の基準日を指定できる |
+| `compare_school_records` | 同じ学校コードについて、2つの公表版の記録、変更された項目名、各版の出典を返す |
+
+学校種には `B1`（小学校）、`C1`（中学校）、`D1`（高等学校）、`F1`（大学）などがあります。設置区分 `operator_category` は `1`（国立）、`2`（公立）、`3`（私立）です。[学校コードの構成とコード表（PDF）](https://www.mext.go.jp/content/20210128-mxt_chousa01-000011635_01.pdf)
+
+公表版の日付には、配布ページに載っている基準日を `YYYY-MM-DD` で指定します。片方の版にコードが見つからない場合、その版の `school` と比較結果の `changed_fields` は `null` になります。コードが変更された場合は、新旧のコードをそれぞれ照会してください。
 
 ## CLIで使う
 
 結果は標準出力にUTF-8のJSONで返ります。
 
 ```sh
-uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.git@main jp-school-code-mcp search-schools --name "東京大学" --prefecture "東京都"
+uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.git@main jp-school-code-mcp search-schools --name "東京大学" --prefecture "東京都" --school-type F1 --operator-category 1
+uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.git@main jp-school-code-mcp compare-school-records --school-code F113310103073 --from-date 2025-05-01 --to-date 2026-05-01
 ```
 
 ## Pythonから呼び出す
@@ -83,17 +89,19 @@ uv sync --locked
 
 ```python
 import asyncio
+from datetime import date
 
-from jp_school_code_mcp import search_schools
+from jp_school_code_mcp import compare_school_records, search_schools
 
-print(asyncio.run(search_schools(name="東京大学", prefecture="東京都")))
+print(asyncio.run(search_schools(prefecture="東京都", school_type="F1", operator_category="1")))
+print(asyncio.run(compare_school_records("F113310103073", date(2025, 5, 1), date(2026, 5, 1))))
 ```
 
 ## データの更新
 
-MCP・CLI・Pythonは同じローカルキャッシュを使います。初回は複数の公式CSVを取得するため、時間がかかることがあります。MCPクライアントでタイムアウトする場合は、下のコマンドを先に実行してキャッシュを作成してください。確認間隔は7日で、期限を過ぎた最初の照会時に更新を確認します。更新に失敗した場合は直前の正常な版を返し、`cache.refresh_failed` と `cache.checked_at` で失敗の有無と最後に確認できた日時を判別できます。初回取得に失敗した場合はエラーになります。
+MCP・CLI・Pythonは同じローカルキャッシュを使います。最新版と、基準日を指定した公表版は別々に保存します。初回は版ごとに複数の公式CSVを取得するため、時間がかかることがあります。MCPクライアントでタイムアウトする場合は、使いたい版をCLIで先に照会してキャッシュを作成してください。確認間隔は7日で、期限を過ぎた最初の照会時に更新を確認します。更新に失敗した場合は直前の正常な版を返し、`cache.refresh_failed` と `cache.checked_at` で失敗の有無と最後に確認できた日時を判別できます。初回取得に失敗した場合はエラーになります。
 
-すぐに更新したいときは次を実行します。
+最新版をすぐに更新したいときは次を実行します。
 
 ```sh
 uvx --python 3.12 --from git+https://github.com/koizumikento/jp-school-code-mcp.git@main jp-school-code-mcp refresh
